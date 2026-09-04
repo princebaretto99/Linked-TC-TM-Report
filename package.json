@@ -1,0 +1,15 @@
+{
+  "name": "bstack-tc-report",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Test case-level status report for BrowserStack Test Management automation runs",
+  "scripts": {
+    "serve": "node server.mjs",
+    "report": "node bin/report.mjs",
+    "test": "node --test 'test/*.test.mjs'"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
