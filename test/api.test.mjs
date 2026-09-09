@@ -75,24 +75,29 @@ test('concurrent requests are paced, never fired as a burst', async () => {
   }
 });
 
-test('a 429 parks every queued request, not just the one that was rejected', async () => {
+test('a 429 parks every request still queued, not just the one that was rejected', async () => {
   const original = globalThis.fetch;
   const startedAt = [];
-  let served = 0;
+  let served = 0, rejectedAt = 0;
   globalThis.fetch = async () => {
     startedAt.push(Date.now());
     // Only the very first call is rejected; the rest would succeed immediately if unparked.
-    return ++served === 1
-      ? json({ error: 'slow down' }, 429, { 'retry-after': '1' })
-      : json({ test_run: {} });
+    if (++served > 1) return json({ test_run: {} });
+    rejectedAt = Date.now();
+    return json({ error: 'slow down' }, 429, { 'retry-after': '1' });
   };
   try {
     const client = new TestManagementClient();
-    const t0 = Date.now();
     await Promise.all(Array.from({ length: 6 }, (_, i) => client.findTestRun('PR-1', 'TR-' + i)));
-    const afterFirst = startedAt.slice(1).filter((at) => at - t0 >= 900);
-    assert.equal(afterFirst.length, startedAt.length - 1,
-      'every request after the 429 waited out the Retry-After window');
+
+    // Requests already in flight when the 429 landed cannot be held back — the ones that matter
+    // are those still queued, and every one of them must wait out the Retry-After window.
+    const stillQueued = startedAt.filter((at) => at > rejectedAt);
+    assert.ok(stillQueued.length >= 2, `expected requests to still be queued, saw ${stillQueued.length}`);
+    for (const at of stillQueued) {
+      assert.ok(at - rejectedAt >= 900,
+        `a queued request started ${at - rejectedAt}ms after the 429, before the window elapsed`);
+    }
   } finally {
     globalThis.fetch = original;
   }

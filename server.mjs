@@ -62,9 +62,11 @@ const MAX_BUILD_PAGE_SIZE = 200;
 /**
  * How long a *listing* of builds may be reused. Short, because it only has to outlive a user
  * paging and filtering through the sidebar — the thing this exists to stop is one click on
- * "next page" re-running an identifier sweep and earning a 429.
+ * "next page" re-running an identifier sweep and earning a 429. Raise it on a busy account where
+ * the sweep is expensive; lower it if a newly finished build must appear in the list sooner.
+ * Only affects which builds are LISTED — an opened report is always fetched live.
  */
-const BUILDS_TTL_MS = 60_000;
+const BUILDS_TTL_MS = Number(process.env.BSTACK_BUILDS_TTL_MS) || 60_000;
 
 async function cachedReference(key, producer, { force = false } = {}) {
   const hit = cache.get(key);

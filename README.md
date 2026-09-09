@@ -58,7 +58,14 @@ page size is display-only: the full listing is fetched either way, so lowering i
 shorter, **not** the fetch smaller or the API load lighter. Without the snapshot, each page click
 would re-run the identifier sweep described under **The API's run list is incomplete** in
 [Troubleshooting](#troubleshooting) and quickly earn an HTTP 429. The snapshot only decides *which
-builds appear in the list*; opening one still fetches its results live.
+builds appear in the list*; opening one still fetches its results live. `BSTACK_BUILDS_TTL_MS`
+overrides the 60-second window — raise it on a busy account where the sweep is expensive, lower it
+if a newly finished build must show up in the list sooner.
+
+Every listing fetch shows the same spinner in the build list, labelled with what it is doing
+(*Fetching builds…*, *Loading page 3…*, *Filtering…*, *Refreshing builds…*). It is held back 150 ms
+first: paging and filtering normally return in about a millisecond, and a spinner that fast is a
+flicker rather than feedback, so only the fetches that genuinely take time ever draw one.
 
 The page does not re-implement the report — it fetches the exact HTML `renderHtml` produces and
 frames it, so what you see and what you download are the same bytes.

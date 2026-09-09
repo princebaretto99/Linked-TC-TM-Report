@@ -100,6 +100,8 @@ html, body { height: 100%; }
 body {
   margin: 0; background: var(--bg); color: var(--text); overflow: hidden;
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* A column, so the layout below the topbar simply takes whatever height is left. */
+  display: flex; flex-direction: column;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
 .muted { color: var(--muted); }
@@ -107,6 +109,7 @@ body {
 .topbar {
   display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap;
   padding: 10px 18px; background: var(--surface); border-bottom: 1px solid var(--border);
+  flex: none;   /* it wraps to two or three rows when narrow; let it be as tall as it needs */
 }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; }
 .brand-mark { display: inline-flex; width: 22px; height: 22px; flex: none; }
@@ -131,7 +134,13 @@ select:disabled, input:disabled { opacity: .55; }
 .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .btn:disabled { opacity: .45; cursor: default; }
 
-.layout { display: grid; grid-template-columns: 320px 1fr; height: calc(100vh - 53px); }
+/*
+ * Fills the space the topbar leaves, rather than subtracting a guess at its height. The old
+ * calc(100vh - 53px) assumed a single-row topbar; as soon as it wrapped (a narrow window, a long
+ * project name, a zoomed page) it stood 176px tall, the layout overflowed by the difference, and
+ * the sidebar's pager was pushed under the bottom edge with body overflow hidden to trap it there.
+ */
+.layout { display: grid; grid-template-columns: 320px 1fr; flex: 1; min-height: 0; }
 .sidebar { background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .sidebar-head { padding: 12px 14px 8px; border-bottom: 1px solid var(--border); }
 .sidebar-head input { width: 100%; }
@@ -212,8 +221,8 @@ select:disabled, input:disabled { opacity: .55; }
 }
 
 @media (max-width: 800px) {
-  body { overflow: auto; }
-  .layout { grid-template-columns: 1fr; height: auto; }
+  body { overflow: auto; height: auto; }
+  .layout { grid-template-columns: 1fr; flex: none; }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
   .runs { max-height: 260px; }
   .stage { height: 78vh; }
@@ -324,8 +333,48 @@ const SCRIPT = `
     }).join('');
   }
 
+  function showPickProject() {
+    showState('<div class="placeholder"><p class="placeholder-title">Pick a project</p>' +
+              '<p>Choose a project above to list its builds, then pick one to see its ' +
+              'test case-level report.</p></div>');
+  }
+
+  function showPickBuild() {
+    showState('<div class="placeholder"><p class="placeholder-title">Pick a build</p>' +
+              '<p>Choose a build from the list to see its test case-level report. Builds that were ' +
+              're-run are reported as one, with all their runs merged.</p></div>');
+  }
+
+  /**
+   * One loading treatment for every listing fetch, so paging looks like everything else.
+   *
+   * Paging and filtering are normally served from the server's in-memory snapshot and land in
+   * about a millisecond; painting a spinner for that is a flicker, not feedback. So it is held
+   * back briefly, and only the fetches that actually take time ever draw it — which is exactly
+   * what happens once the snapshot expires and Next has to re-list from BrowserStack.
+   */
+  var LOADING_DELAY_MS = 150;
+  var loadingTimer = null;
+
+  function showListLoading(message, immediate) {
+    clearTimeout(loadingTimer);
+    var paint = function () {
+      buildList.innerHTML = '<li class="runs-loading"><span class="spinner spinner-sm"></span>' +
+        '<span>' + escapeHtml(message) + '</span></li>';
+    };
+    if (immediate) { loadingTimer = null; return paint(); }
+    loadingTimer = setTimeout(function () { loadingTimer = null; paint(); }, LOADING_DELAY_MS);
+  }
+
+  /** Must run before anything else draws the list, or a late timer would stomp the result. */
+  function clearListLoading() {
+    clearTimeout(loadingTimer);
+    loadingTimer = null;
+  }
+
   /** Nothing is selected on arrival: listing a project's builds is expensive, so it waits to be asked. */
   function showNoProjectChosen() {
+    clearListLoading();
     builds = [];
     paging = { page: 1, pageSize: PAGE_SIZE, totalPages: 1, total: 0, totalBuilds: 0, filtered: false };
     buildCount.textContent = '';
@@ -357,6 +406,7 @@ const SCRIPT = `
 
       // An explicit ?project= IS the user asking, so that one loads straight away.
       projectSelect.value = wanted;
+      showPickBuild();   // a project IS chosen now; the arrival copy no longer applies
       await loadBuilds({ initial: true });
       // Deep links accept a build name, or a run id which resolves to the build containing it.
       // Either may live on a page that is not currently loaded; the server resolves it regardless.
@@ -381,15 +431,18 @@ const SCRIPT = `
 
     prevBtn.disabled = true;
     nextBtn.disabled = true;
+    buildCount.textContent = projectLabel();
     if (initial) {
-      // The first listing for a project can take a while — it reconciles runs the API omits — so
-      // say what is happening rather than leaving an empty panel.
-      buildList.innerHTML = '<li class="runs-loading"><span class="spinner spinner-sm"></span>' +
-        '<span>Fetching builds…</span></li>';
-      buildCount.textContent = projectLabel();
+      // A fresh project always takes seconds — it reconciles the runs the API omits — so there is
+      // nothing to wait and see about: show the spinner straight away.
+      showListLoading('Fetching builds…', true);
       buildSearch.disabled = true;
+    } else if (options.force) {
+      showListLoading('Refreshing builds…');
+    } else if (options.viaPager) {
+      showListLoading('Loading page ' + wantPage + '…');
     } else {
-      buildCount.textContent = options.viaPager ? 'Loading page ' + wantPage + '…' : 'Filtering…';
+      showListLoading('Filtering…');
     }
 
     var filter = buildSearch.value.trim();
@@ -401,6 +454,7 @@ const SCRIPT = `
     try {
       var data = await getJson(url);
       if (token !== buildsToken) return;   // a newer page or filter already won
+      clearListLoading();
       builds = data.builds || [];
       paging = {
         page: data.page || 1,
@@ -414,6 +468,7 @@ const SCRIPT = `
       renderBuilds();
     } catch (error) {
       if (token !== buildsToken) return;
+      clearListLoading();
       buildSearch.disabled = false;
       buildCount.textContent = '';
       pager.hidden = true;
@@ -503,12 +558,10 @@ const SCRIPT = `
 
     if (!projectId()) {
       buildsToken++;          // abandon any listing still in flight for the previous project
-      showState('<div class="placeholder"><p class="placeholder-title">Pick a project</p>' +
-                '<p>Choose a project above to list its builds.</p></div>');
+      showPickProject();
       return showNoProjectChosen();
     }
-    showState('<div class="placeholder"><p class="placeholder-title">Pick a build</p>' +
-              '<p>Choose a build from the list to see its test case-level report.</p></div>');
+    showPickBuild();
     loadBuilds({ initial: true });
   });
 
