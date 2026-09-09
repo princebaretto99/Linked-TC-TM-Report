@@ -52,6 +52,20 @@ try {
 const cache = new Map();
 const REFERENCE_TTL_MS = 10 * 60_000;
 
+/**
+ * Builds shown in the sidebar at a time. Unrelated to the API's own page size (see api.mjs): the
+ * full listing is fetched either way and sliced here, so this changes only how much is drawn.
+ */
+const BUILD_PAGE_SIZE = 10;
+const MAX_BUILD_PAGE_SIZE = 200;
+
+/**
+ * How long a *listing* of builds may be reused. Short, because it only has to outlive a user
+ * paging and filtering through the sidebar — the thing this exists to stop is one click on
+ * "next page" re-running an identifier sweep and earning a 429.
+ */
+const BUILDS_TTL_MS = 60_000;
+
 async function cachedReference(key, producer, { force = false } = {}) {
   const hit = cache.get(key);
   if (!force && hit && Date.now() - hit.at < REFERENCE_TTL_MS) return hit.value;
@@ -64,6 +78,54 @@ async function cachedReference(key, producer, { force = false } = {}) {
 async function listBuilds(projectId) {
   const { runs, unindexed } = await client.listTestRunsIncludingUnindexed(projectId);
   return { builds: groupRunsByBuild(runs), unindexed };
+}
+
+/**
+ * The sidebar listing, briefly memoised, and de-duplicated so N concurrent callers share ONE
+ * upstream fetch instead of N sweeps.
+ *
+ * This is the only run data that is ever reused, and it is reused only for navigation — deciding
+ * which builds to draw in the list. `buildReport` deliberately does NOT come through here: the
+ * numbers in a report stay live, because a stale result there is not a slow answer, it is a wrong
+ * one. The worst a stale listing can do is briefly omit a build from the sidebar, and Refresh
+ * (or the 60s expiry) brings it back.
+ */
+const inFlightBuilds = new Map();
+
+async function buildsSnapshot(projectId, { force = false } = {}) {
+  const key = `builds:${projectId}`;
+  const hit = cache.get(key);
+  if (!force && hit && Date.now() - hit.at < BUILDS_TTL_MS) return hit.value;
+
+  const pending = inFlightBuilds.get(key);
+  if (pending && !force) return pending;
+
+  const promise = (async () => {
+    const { builds, unindexed } = await listBuilds(projectId);
+    if (unindexed.length) {
+      console.log(`  recovered run(s) missing from the list: ${unindexed.join(', ')}`);
+    }
+    const value = { builds, unindexed, fetchedAt: Date.now() };
+    cache.set(key, { at: Date.now(), value });
+    return value;
+  })().finally(() => inFlightBuilds.delete(key));
+
+  inFlightBuilds.set(key, promise);
+  return promise;
+}
+
+const matchesQuery = (build, query) =>
+  (`${build.name} ${build.runIds.join(' ')}`).toLowerCase().includes(query);
+
+/** Clamps to a sane range rather than rejecting — a bad page number is not worth a 400. */
+function readPaging(url) {
+  const rawSize = Number(url.searchParams.get('page_size'));
+  const pageSize = Number.isInteger(rawSize) && rawSize > 0
+    ? Math.min(rawSize, MAX_BUILD_PAGE_SIZE)
+    : BUILD_PAGE_SIZE;
+  const rawPage = Number(url.searchParams.get('page'));
+  const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : 1;
+  return { page, pageSize };
 }
 
 /**
@@ -162,14 +224,35 @@ const routes = {
     sendJson(res, 200, { projects });
   },
 
-  /** Always live, and probes past the list so a just-finished build is selectable immediately. */
+  /**
+   * One page of the build list. Probes past the API's own listing so a just-finished build is
+   * selectable immediately, then filters and slices in memory — so paging and typing in the filter
+   * cost nothing upstream. `refresh=1` re-fetches.
+   */
   async 'GET /api/builds'(url, res) {
     const projectId = requireParam(url, 'project');
-    const { builds, unindexed } = await listBuilds(projectId);
-    if (unindexed.length) console.log(`  recovered run(s) missing from the list: ${unindexed.join(', ')}`);
+    const force = url.searchParams.get('refresh') === '1';
+    const { builds, unindexed, fetchedAt } = await buildsSnapshot(projectId, { force });
+
+    const query = (url.searchParams.get('q') ?? '').trim().toLowerCase();
+    const matches = query ? builds.filter((build) => matchesQuery(build, query)) : builds;
+
+    const { pageSize } = readPaging(url);
+    const totalPages = Math.max(1, Math.ceil(matches.length / pageSize));
+    const page = Math.min(readPaging(url).page, totalPages);   // a stale page number lands on the last
+    const start = (page - 1) * pageSize;
+
     sendJson(res, 200, {
-      builds: builds.map(({ runs, ...rest }) => rest),   // run records themselves are not needed client-side
-      fetchedAt: Date.now(),
+      // The run records themselves are not needed client-side.
+      builds: matches.slice(start, start + pageSize).map(({ runs, ...rest }) => rest),
+      page,
+      pageSize,
+      totalPages,
+      total: matches.length,        // after the filter
+      totalBuilds: builds.length,   // before it
+      filtered: Boolean(query),
+      unindexed,
+      fetchedAt,
     });
   },
 

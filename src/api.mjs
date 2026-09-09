@@ -6,8 +6,122 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const BASE_URL = 'https://test-management.browserstack.com/api/v2';
-const PAGE_SIZE = 300;   // API accepts ONLY 30 or 300 — not an arbitrary value in that range
+// The API accepts ONLY 30 or 300 — not an arbitrary value in that range. 300 is deliberate:
+// it is the setting that makes the FEWEST requests, and requests are the thing being limited.
+// Dropping to 30 would turn one call into ten and trip the limiter ten times sooner. The 30-per-page
+// list in the web UI is a separate, display-only page size — see BUILD_PAGE_SIZE in server.mjs.
+const PAGE_SIZE = 300;
 const MAX_PAGES = 100;   // runaway guard
+
+/**
+ * Rate-limit budget. A full identifier sweep is hundreds of requests, so it must be paced rather
+ * than fired in a burst; `MIN_GAP_MS` is what actually caps throughput (~16 req/s by default),
+ * `MAX_CONCURRENCY` just stops a slow response from stalling the queue behind it.
+ * Both are tunable without a code change if BrowserStack's ceiling turns out to differ per account.
+ */
+const MAX_CONCURRENCY = Number(process.env.BSTACK_MAX_CONCURRENCY) || 4;
+const MIN_GAP_MS = Number(process.env.BSTACK_MIN_REQUEST_GAP_MS) || 60;
+const MAX_RETRIES = Number(process.env.BSTACK_MAX_RETRIES) || 4;
+const MAX_BACKOFF_MS = 30_000;
+
+/**
+ * Candidate count above which it is worth spending one list call per project to rule ids out
+ * (see `#runIdsOwnedElsewhere`). Below it, probing directly is the cheaper of the two.
+ */
+const OWNERSHIP_MAP_THRESHOLD = Number(process.env.BSTACK_OWNERSHIP_MAP_THRESHOLD) || 200;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Serialises every outbound call in the process behind one budget: at most `concurrency` in
+ * flight, and never two starts closer together than `minGapMs`.
+ *
+ * `pauseFor` is the part that matters on a 429. Rate limits are per account, not per request, so
+ * one rejection means every other in-flight call is about to be rejected too — parking the whole
+ * queue for the retry window turns a cascade of failures into one short stall.
+ */
+class RequestThrottle {
+  constructor({ concurrency = MAX_CONCURRENCY, minGapMs = MIN_GAP_MS } = {}) {
+    this.concurrency = Math.max(1, concurrency);
+    this.minGapMs = Math.max(0, minGapMs);
+    this.active = 0;
+    this.queue = [];
+    this.lastStart = 0;
+    this.pausedUntil = 0;
+    this.timer = null;
+  }
+
+  /** Holds back every queued and future request until `ms` from now. */
+  pauseFor(ms) {
+    this.pausedUntil = Math.max(this.pausedUntil, Date.now() + ms);
+  }
+
+  run(task) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ task, resolve, reject });
+      this.#pump();
+    });
+  }
+
+  #pump() {
+    if (this.queue.length === 0 || this.active >= this.concurrency) return;
+
+    const now = Date.now();
+    const readyAt = Math.max(this.pausedUntil, this.lastStart + this.minGapMs);
+    if (readyAt > now) {
+      // One shared timer — every pump() while waiting must not stack up its own.
+      if (this.timer === null) {
+        this.timer = setTimeout(() => { this.timer = null; this.#pump(); }, readyAt - now);
+      }
+      return;
+    }
+
+    const { task, resolve, reject } = this.queue.shift();
+    this.active += 1;
+    this.lastStart = now;
+    Promise.resolve().then(task).then(resolve, reject).finally(() => {
+      this.active -= 1;
+      this.#pump();
+    });
+    this.#pump();   // fill the remaining concurrency slots (each re-checks the gap)
+  }
+}
+
+/**
+ * A connection that never completed, rather than a server that answered. Worth retrying, and
+ * worth retrying FAST: the common case is a keep-alive socket the far end closed while idle, which
+ * fails instantly and succeeds on the very next attempt.
+ */
+function networkRetryDelayMs(attempt) {
+  const backoff = Math.min(250 * 2 ** attempt, 4000);
+  return Math.round(backoff * (0.75 + Math.random() * 0.5));
+}
+
+/**
+ * undici reports every connection failure as the same bare "fetch failed"; the code that says what
+ * actually happened (ECONNRESET, ENOTFOUND, UND_ERR_SOCKET…) is buried in the cause chain.
+ */
+function describeCause(error) {
+  const parts = [];
+  for (let node = error, depth = 0; node && depth < 5; node = node.cause, depth++) {
+    const text = node.code ? `${node.code} ${node.message ?? ''}`.trim() : node.message;
+    if (text && !parts.includes(text)) parts.push(text);
+  }
+  return parts.join(' — ') || String(error);
+}
+
+/** `Retry-After` is authoritative when present; otherwise back off exponentially with jitter. */
+function retryDelayMs(response, attempt) {
+  const header = response?.headers?.get?.('retry-after');
+  if (header) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, MAX_BACKOFF_MS);
+    const at = Date.parse(header);
+    if (!Number.isNaN(at)) return Math.min(Math.max(at - Date.now(), 0), MAX_BACKOFF_MS);
+  }
+  const backoff = Math.min(1000 * 2 ** attempt, MAX_BACKOFF_MS);
+  return Math.round(backoff * (0.75 + Math.random() * 0.5));   // jitter, so retries don't resync
+}
 
 /** Minimal .env reader — avoids a dependency on dotenv. */
 function loadDotEnv(cwd = process.cwd()) {
@@ -50,33 +164,65 @@ export class TestManagementClient {
     this.discoveredRuns = new Map();
     /** Projects whose identifier range has already been swept once. */
     this.sweptProjects = new Set();
+    /** Promise of runId → owning project, built lazily and at most once. */
+    this.ownershipMap = null;
+    /** One budget for the whole client — see RequestThrottle. */
+    this.throttle = new RequestThrottle();
+    /** Set while a 429 is being waited out, so callers can surface "backing off" instead of stalling. */
+    this.onThrottled = null;
   }
 
-  async request(pathname, { searchParams = {} } = {}) {
+  /**
+   * Every call to the API goes through here, so this is the one place that has to be
+   * rate-limit-aware: paced by the shared throttle, and retried with backoff on the statuses that
+   * mean "later, not never" (429, and the 5xx that BrowserStack returns when a limiter sheds load).
+   */
+  async request(pathname, { searchParams = {}, retries = MAX_RETRIES } = {}) {
     const url = new URL(BASE_URL + pathname);
     for (const [k, v] of Object.entries(searchParams)) {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     }
 
-    let response;
-    try {
-      response = await fetch(url, {
-        headers: { Authorization: this.auth, Accept: 'application/json' },
-      });
-    } catch (cause) {
-      throw new ApiError(`Network error calling ${url.pathname}: ${cause.message}`, { url: url.href });
-    }
+    for (let attempt = 0; ; attempt++) {
+      let response;
+      try {
+        response = await this.throttle.run(() => fetch(url, {
+          headers: { Authorization: this.auth, Accept: 'application/json' },
+        }));
+      } catch (cause) {
+        // A dropped connection is not an answer — retry it, exactly like a 429. Without this a
+        // single stale keep-alive socket surfaces in the UI as a hard 502.
+        if (attempt < retries) {
+          const delay = networkRetryDelayMs(attempt);
+          this.onThrottled?.({ status: 0, url: url.href, delay, attempt: attempt + 1 });
+          await sleep(delay);
+          continue;
+        }
+        throw new ApiError(
+          `Network error calling ${url.pathname} after ${attempt + 1} attempts: ` +
+          `${describeCause(cause)}\nCheck connectivity to ${url.host} (VPN or proxy, if you use one).`,
+          { url: url.href });
+      }
 
-    const text = await response.text();
-    let body;
-    try { body = JSON.parse(text); } catch { body = text; }
+      const text = await response.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = text; }
 
-    if (!response.ok) {
-      throw new ApiError(explainHttpError(response.status, url, body), {
+      if (response.ok) return body;
+
+      if (isRetryable(response.status) && attempt < retries) {
+        const delay = retryDelayMs(response, attempt);
+        // Park every other queued request too: the limit is per account, not per request.
+        this.throttle.pauseFor(delay);
+        this.onThrottled?.({ status: response.status, url: url.href, delay, attempt: attempt + 1 });
+        await sleep(delay);
+        continue;
+      }
+
+      throw new ApiError(explainHttpError(response.status, url, body, { attempts: attempt + 1 }), {
         status: response.status, url: url.href, body,
       });
     }
-    return body;
   }
 
   /** Follows `p=1,2,...` until `info.next` is null, concatenating `body[collectionKey]`. */
@@ -171,6 +317,16 @@ export class TestManagementClient {
     for (let n = from; n <= highest + probeAhead; n++) candidates.add(`TR-${n}`);
     for (const id of known) candidates.delete(id);
 
+    // Run identifiers are allocated per ACCOUNT, not per project, so a sparse project's range is
+    // mostly other projects' runs. Measured on PR-24: of 882 ids in TR-242..TR-1183, 863 were
+    // listed under some other project and only 19 were unaccounted for — 53s of 404s to learn
+    // nothing. A run another project lists cannot also be a hidden run of this one, so those are
+    // provably skippable. Only worth the ownership map when the sweep is big enough to pay for it.
+    if (candidates.size > OWNERSHIP_MAP_THRESHOLD) {
+      const elsewhere = await this.#runIdsOwnedElsewhere(projectId);
+      for (const id of elsewhere) candidates.delete(id);
+    }
+
     const found = await this.#probeRuns(projectId, [...candidates]);
     this.sweptProjects.add(projectId);
 
@@ -181,15 +337,42 @@ export class TestManagementClient {
     return { runs: [...runs, ...found], unindexed: found.map((run) => run.identifier) };
   }
 
-  /** Batched so a full sweep does not fire a hundred simultaneous requests. */
-  async #probeRuns(projectId, ids, batchSize = 12) {
-    const found = [];
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = await Promise.all(
-        ids.slice(i, i + batchSize).map((id) => this.findTestRun(projectId, id)));
-      found.push(...batch.filter(Boolean));
-    }
-    return found;
+  /**
+   * Every run id the account lists under a project OTHER than `projectId`.
+   *
+   * Built once per process from one list call per project, and deliberately conservative: the list
+   * endpoint hides re-runs, so a hidden run of another project is simply absent here and stays in
+   * the candidate set. Nothing is skipped that has not been positively attributed elsewhere.
+   *
+   * Degrades to an empty set — sweep everything, as before — if the account cannot be enumerated.
+   */
+  #runIdsOwnedElsewhere(projectId) {
+    this.ownershipMap ??= (async () => {
+      const projects = await this.listProjects();
+      const owners = new Map();
+      await Promise.all(projects.map(async (project) => {
+        const runs = await this.listTestRuns(project.identifier).catch(() => []);
+        for (const run of runs) owners.set(run.identifier, project.identifier);
+      }));
+      return owners;
+    })().catch(() => new Map());
+
+    return this.ownershipMap.then((owners) => {
+      const elsewhere = new Set();
+      for (const [runId, owner] of owners) if (owner !== projectId) elsewhere.add(runId);
+      return elsewhere;
+    });
+  }
+
+  /**
+   * A sweep is hundreds of mostly-404 requests, and firing them in a burst is what earned the 429s
+   * this client used to fall over on. They are all handed to the throttle at once and it releases
+   * them at the budgeted rate — which is both gentler and faster than fixed batches, since a slow
+   * response no longer holds up the eleven ids queued behind it.
+   */
+  async #probeRuns(projectId, ids) {
+    const settled = await Promise.all(ids.map((id) => this.findTestRun(projectId, id)));
+    return settled.filter(Boolean);
   }
 
   /** The roster: every test case linked to the run, one row per (test case, configuration). */
@@ -225,7 +408,12 @@ export class TestManagementClient {
   }
 }
 
-function explainHttpError(status, url, body) {
+/** 429 is the rate limiter; 502/503/504 are the load shedders in front of it. */
+function isRetryable(status) {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+function explainHttpError(status, url, body, { attempts = 1 } = {}) {
   const detail = typeof body === 'string'
     ? body.slice(0, 400)
     : JSON.stringify(body ?? {}).slice(0, 400);
@@ -240,7 +428,11 @@ function explainHttpError(status, url, body) {
            `Verify the project/run id is correct and visible to you.\n${detail}`;
   }
   if (status === 429) {
-    return `HTTP 429 on ${where} — rate limited by BrowserStack. Retry in a minute.\n${detail}`;
+    return `HTTP 429 on ${where} — still rate limited by BrowserStack after ${attempts} ` +
+           `attempt${attempts === 1 ? '' : 's'} with backoff. Wait a minute, then retry. ` +
+           'If this is persistent, lower the request rate: ' +
+           'BSTACK_MIN_REQUEST_GAP_MS (default ' + MIN_GAP_MS + ') and ' +
+           'BSTACK_MAX_CONCURRENCY (default ' + MAX_CONCURRENCY + `).\n${detail}`;
   }
   return `HTTP ${status} on ${where}\n${detail}`;
 }

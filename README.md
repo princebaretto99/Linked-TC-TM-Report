@@ -46,6 +46,20 @@ build, reload, and you see the new numbers. The content bar stamps when the repo
 freshness is never in doubt. Only the project list and the configuration list (hundreds of rows,
 effectively static) are cached, for 10 minutes; **Refresh** clears them and re-lists runs.
 
+**No project is selected on arrival.** Listing a project's builds is the expensive call — it
+reconciles the runs the API omits — so it waits to be asked rather than firing for whichever
+project happened to sort first. A `?project=PR-x` deep link counts as asking and loads straight
+away.
+
+The build list is paginated at **10 per page**, filtered and sliced server-side from a listing
+snapshot held for 60 seconds. Paging and typing in the filter cost nothing upstream — measured on a
+1,679-build project, every page including the 168th returns in under a millisecond. Note that the
+page size is display-only: the full listing is fetched either way, so lowering it makes the list
+shorter, **not** the fetch smaller or the API load lighter. Without the snapshot, each page click
+would re-run the identifier sweep described under **The API's run list is incomplete** in
+[Troubleshooting](#troubleshooting) and quickly earn an HTTP 429. The snapshot only decides *which
+builds appear in the list*; opening one still fetches its results live.
+
 The page does not re-implement the report — it fetches the exact HTML `renderHtml` produces and
 frames it, so what you see and what you download are the same bytes.
 
@@ -188,7 +202,35 @@ node bin/report.mjs -p PR-155 -r TR-78282 --raw results
 ```
 
 **HTTP 400 "Invalid page_size".** The API accepts only `30` or `300` — not an arbitrary value in
-that range, despite the docs describing it as a range.
+that range, despite the docs describing it as a range. The client asks for `300` deliberately: it
+is the setting that makes the fewest requests, and requests are what get rate limited. The 30-per-page
+build list in the web UI is a separate, display-only page size and does not change what is fetched.
+
+**HTTP 429 "rate limited".** Handled automatically — every call is paced by a shared throttle
+(max 4 in flight, ≥60 ms apart) and retried up to 4 times with exponential backoff, honouring
+`Retry-After`. Because the limit is per account, a 429 parks *every* queued request for the retry
+window rather than letting the rest fail behind it.
+
+**HTTP 502 "Network error calling …".** The server could not reach BrowserStack at all — as opposed
+to reaching it and being refused, which surfaces as 401/404/429. Dropped connections are retried
+like a 429 (fast backoff: a keep-alive socket the far end closed while idle fails instantly and
+succeeds on the next attempt), so a 502 means it failed every attempt. The message names the real
+cause — `ECONNRESET`, `ENOTFOUND`, `UND_ERR_SOCKET` — rather than undici's bare "fetch failed";
+check VPN or proxy if you use one.
+
+If you still see 429s — a busy account, or several tools sharing the credentials — slow the client
+down without touching the code:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BSTACK_MIN_REQUEST_GAP_MS` | `60` | Minimum gap between request starts. Raise it to lower the rate (`120` ≈ 8 req/s). |
+| `BSTACK_MAX_CONCURRENCY` | `4` | Requests in flight at once. |
+| `BSTACK_MAX_RETRIES` | `4` | Retries before a 429 or connection failure is surfaced as an error. |
+| `BSTACK_OWNERSHIP_MAP_THRESHOLD` | `200` | Sweep size above which ids are ruled out by owner first (below). |
+
+```bash
+BSTACK_MIN_REQUEST_GAP_MS=150 node server.mjs
+```
 
 **HTTP 401.** Credentials rejected — check `.env`, and that the account has Test Management access.
 
